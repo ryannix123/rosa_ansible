@@ -1,0 +1,335 @@
+---
+- name: Deploy ROSA with Hosted Control Planes on AWS
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    cluster_name: "rosa-hcp-cluster"
+    region: "us-east-2"
+    machine_cidr: "10.0.0.0/16"
+    worker_instance_type: "m5.xlarge"
+    worker_node_count: 3
+    operator_roles_prefix: "{{ cluster_name }}-operator"
+    account_roles_prefix: "{{ cluster_name }}-account"
+    timeout_minutes: 5
+    vpc_name: "rosa-hcp-vpc"
+    public_subnet_cidrs:
+      - "10.0.0.0/24"
+      - "10.0.1.0/24"
+      - "10.0.2.0/24"
+    private_subnet_cidrs:
+      - "10.0.3.0/24"
+      - "10.0.4.0/24"
+      - "10.0.5.0/24"
+    availability_zones:
+      - us-east-2a
+      - us-east-2b
+      - us-east-2c
+
+  tasks:
+    - name: Delete any unused EIPs
+      shell: |
+        for eip in $(aws ec2 describe-addresses --region {{ region }} --query 'Addresses[?AssociationId==null].AllocationId' --output text); do
+          aws ec2 release-address --allocation-id $eip --region {{ region }}
+        done
+      ignore_errors: yes
+
+    - name: Delete existing VPCs with same name
+      shell: |
+        VPC_ID=$(aws ec2 describe-vpcs --region {{ region }} --filters "Name=tag:Name,Values={{ vpc_name }}" --query 'Vpcs[0].VpcId' --output text)
+        if [ "$VPC_ID" != "None" ] && [ "$VPC_ID" != "null" ]; then
+          # Delete NAT Gateways
+          for natgw in $(aws ec2 describe-nat-gateways --region {{ region }} --filter "Name=vpc-id,Values=$VPC_ID" --query 'NatGateways[].NatGatewayId' --output text); do
+            aws ec2 delete-nat-gateway --nat-gateway-id $natgw --region {{ region }}
+          done
+          
+          # Delete Subnets
+          for subnet in $(aws ec2 describe-subnets --region {{ region }} --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text); do
+            aws ec2 delete-subnet --subnet-id $subnet --region {{ region }}
+          done
+          
+          # Detach and Delete Internet Gateway
+          for igw in $(aws ec2 describe-internet-gateways --region {{ region }} --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query 'InternetGateways[].InternetGatewayId' --output text); do
+            aws ec2 detach-internet-gateway --internet-gateway-id $igw --vpc-id $VPC_ID --region {{ region }}
+            aws ec2 delete-internet-gateway --internet-gateway-id $igw --region {{ region }}
+          done
+          
+          # Delete Route Tables
+          for rtb in $(aws ec2 describe-route-tables --region {{ region }} --filters "Name=vpc-id,Values=$VPC_ID" --query 'RouteTables[?RouteTableId!=`null`].[RouteTableId]' --output text); do
+            if [ "$rtb" != $(aws ec2 describe-route-tables --region {{ region }} --filters "Name=vpc-id,Values=$VPC_ID" "Name=main,Values=true" --query 'RouteTables[].RouteTableId' --output text) ]; then
+              aws ec2 delete-route-table --route-table-id $rtb --region {{ region }}
+            fi
+          done
+          
+          # Delete VPC
+          aws ec2 delete-vpc --vpc-id $VPC_ID --region {{ region }}
+        fi
+      ignore_errors: yes
+
+    - name: Wait for resources to be deleted
+      pause:
+        seconds: 30
+
+    - name: Create VPC
+      command: >
+        aws ec2 create-vpc 
+        --cidr-block {{ machine_cidr }}
+        --region {{ region }}
+        --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value={{ vpc_name }}}]'
+        --output json
+      register: vpc_result
+
+    - name: Extract VPC ID
+      set_fact:
+        vpc_id: "{{ vpc_result.stdout | from_json | json_query('Vpc.VpcId') }}"
+
+    - name: Create public subnets
+      command: >
+        aws ec2 create-subnet
+        --vpc-id {{ vpc_id }}
+        --cidr-block "{{ item.1 }}"
+        --availability-zone {{ item.0 }}
+        --region {{ region }}
+        --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value={{ vpc_name }}-public-{{ item.0 }}},{Key=kubernetes.io/role/elb,Value=1}]'
+        --output json
+      register: public_subnets
+      with_together:
+        - "{{ availability_zones }}"
+        - "{{ public_subnet_cidrs }}"
+
+    - name: Create private subnets
+      command: >
+        aws ec2 create-subnet
+        --vpc-id {{ vpc_id }}
+        --cidr-block "{{ item.1 }}"
+        --availability-zone {{ item.0 }}
+        --region {{ region }}
+        --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value={{ vpc_name }}-private-{{ item.0 }}},{Key=kubernetes.io/role/internal-elb,Value=1}]'
+        --output json
+      register: private_subnets
+      with_together:
+        - "{{ availability_zones }}"
+        - "{{ private_subnet_cidrs }}"
+
+    - name: Extract all subnet IDs
+      set_fact:
+        all_subnet_ids: "{{ (public_subnets.results | map(attribute='stdout') | map('from_json') | map(attribute='Subnet.SubnetId') | list + 
+                            private_subnets.results | map(attribute='stdout') | map('from_json') | map(attribute='Subnet.SubnetId') | list) | join(',') }}"
+
+    - name: Create Internet Gateway
+      command: >
+        aws ec2 create-internet-gateway
+        --region {{ region }}
+        --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value={{ vpc_name }}-igw}]'
+        --output json
+      register: igw_result
+
+    - name: Attach Internet Gateway to VPC
+      command: >
+        aws ec2 attach-internet-gateway
+        --vpc-id {{ vpc_id }}
+        --internet-gateway-id {{ igw_result.stdout | from_json | json_query('InternetGateway.InternetGatewayId') }}
+        --region {{ region }}
+
+    - name: Create NAT Gateway EIP
+      command: >
+        aws ec2 allocate-address
+        --domain vpc
+        --region {{ region }}
+        --output json
+      register: eip_result
+
+    - name: Extract first public subnet ID
+      set_fact:
+        first_public_subnet: "{{ public_subnets.results[0].stdout | from_json | json_query('Subnet.SubnetId') }}"
+
+    - name: Create NAT Gateway
+      command: >
+        aws ec2 create-nat-gateway
+        --subnet-id {{ first_public_subnet }}
+        --allocation-id {{ eip_result.stdout | from_json | json_query('AllocationId') }}
+        --region {{ region }}
+        --output json
+      register: nat_gateway
+
+    - name: Wait for NAT Gateway to be available
+      command: >
+        aws ec2 describe-nat-gateways
+        --nat-gateway-ids {{ nat_gateway.stdout | from_json | json_query('NatGateway.NatGatewayId') }}
+        --region {{ region }}
+        --query 'NatGateways[0].State'
+        --output text
+      register: nat_status
+      until: nat_status.stdout == 'available'
+      retries: 30
+      delay: 10
+
+    - name: Create public route table
+      command: >
+        aws ec2 create-route-table
+        --vpc-id {{ vpc_id }}
+        --region {{ region }}
+        --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value={{ vpc_name }}-public-rtb}]'
+        --output json
+      register: public_rtb
+
+    - name: Create private route table
+      command: >
+        aws ec2 create-route-table
+        --vpc-id {{ vpc_id }}
+        --region {{ region }}
+        --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value={{ vpc_name }}-private-rtb}]'
+        --output json
+      register: private_rtb
+
+    - name: Add Internet Gateway route to public route table
+      command: >
+        aws ec2 create-route
+        --route-table-id {{ public_rtb.stdout | from_json | json_query('RouteTable.RouteTableId') }}
+        --destination-cidr-block 0.0.0.0/0
+        --gateway-id {{ igw_result.stdout | from_json | json_query('InternetGateway.InternetGatewayId') }}
+        --region {{ region }}
+
+    - name: Add NAT Gateway route to private route table
+      command: >
+        aws ec2 create-route
+        --route-table-id {{ private_rtb.stdout | from_json | json_query('RouteTable.RouteTableId') }}
+        --destination-cidr-block 0.0.0.0/0
+        --nat-gateway-id {{ nat_gateway.stdout | from_json | json_query('NatGateway.NatGatewayId') }}
+        --region {{ region }}
+
+    - name: Associate public subnets with public route table
+      command: >
+        aws ec2 associate-route-table
+        --subnet-id {{ item.stdout | from_json | json_query('Subnet.SubnetId') }}
+        --route-table-id {{ public_rtb.stdout | from_json | json_query('RouteTable.RouteTableId') }}
+        --region {{ region }}
+      with_items: "{{ public_subnets.results }}"
+
+    - name: Associate private subnets with private route table
+      command: >
+        aws ec2 associate-route-table
+        --subnet-id {{ item.stdout | from_json | json_query('Subnet.SubnetId') }}
+        --route-table-id {{ private_rtb.stdout | from_json | json_query('RouteTable.RouteTableId') }}
+        --region {{ region }}
+      with_items: "{{ private_subnets.results }}"
+
+    - name: Enable DNS hostnames for VPC
+      command: >
+        aws ec2 modify-vpc-attribute
+        --vpc-id {{ vpc_id }}
+        --enable-dns-hostnames
+        --region {{ region }}
+
+    - name: Enable DNS support for VPC
+      command: >
+        aws ec2 modify-vpc-attribute
+        --vpc-id {{ vpc_id }}
+        --enable-dns-support
+        --region {{ region }}
+
+    - name: Ensure rosa CLI is installed
+      command: which rosa
+      register: rosa_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Fail if rosa CLI is not installed
+      fail:
+        msg: "Rosa CLI is not installed. Please install it first."
+      when: rosa_check.rc != 0
+
+    - name: Create OIDC Configuration
+      command: >
+        rosa create oidc-config 
+        --mode auto 
+        --yes
+      register: oidc_result
+      async: "{{ timeout_minutes * 60 }}"
+      poll: 30
+
+    - name: Extract OIDC Config ID
+      shell: >
+        rosa list oidc-config --output json | jq -r '.[0].id'
+      register: oidc_config_id
+      changed_when: false
+
+    - name: Create account roles
+      command: >
+        rosa create account-roles 
+        --prefix {{ account_roles_prefix }} 
+        --hosted-cp
+        --mode auto
+        --yes
+      register: account_roles_result
+      async: "{{ timeout_minutes * 60 }}"
+      poll: 30
+
+    - name: Wait for account roles to be available
+      pause:
+        seconds: 30
+
+    - name: Get installer role ARN
+      shell: |
+        aws iam list-roles --query "Roles[?contains(RoleName, '{{ account_roles_prefix }}') && contains(RoleName, 'Installer')].Arn" --output text
+      register: installer_role
+      changed_when: false
+      until: installer_role.stdout != ""
+      retries: 6
+      delay: 10
+
+    - name: Create operator roles
+      command: >
+        rosa create operator-roles 
+        --prefix {{ operator_roles_prefix }} 
+        --hosted-cp
+        --mode auto
+        --oidc-config-id {{ oidc_config_id.stdout }}
+        --role-arn {{ installer_role.stdout }}
+        --yes
+      register: operator_roles_result
+      async: "{{ timeout_minutes * 60 }}"
+      poll: 30
+
+    - name: Create ROSA cluster with Hosted Control Plane
+      command: >
+        rosa create cluster 
+        --cluster-name {{ cluster_name }}
+        --hosted-cp 
+        --region {{ region }}
+        --subnet-ids {{ all_subnet_ids }}
+        --compute-machine-type {{ worker_instance_type }}
+        --replicas {{ worker_node_count }}
+        --operator-roles-prefix {{ operator_roles_prefix }}
+        --oidc-config-id {{ oidc_config_id.stdout }}
+        --mode auto
+        --yes
+      register: cluster_creation
+      async: "{{ timeout_minutes * 60 }}"
+      poll: 30
+
+    - name: Wait for cluster to be ready
+      shell: |
+        STATE=$(rosa describe cluster --cluster {{ cluster_name }} | grep "^State:" | sed 's/^State:\s*//g' | tr -d '[:space:]')
+        if [ "$STATE" = "ready" ]; then
+          exit 0
+        else
+          exit 1
+        fi
+      register: cluster_status
+      until: cluster_status.rc == 0
+      retries: 60
+      delay: 60
+      changed_when: false
+
+    - name: Get cluster admin credentials
+      command: >
+        rosa create admin --cluster {{ cluster_name }}
+      register: admin_creds
+      changed_when: false
+
+    - name: Display cluster information
+      debug:
+        msg: 
+          - "Cluster {{ cluster_name }} has been created successfully"
+          - "Admin credentials: {{ admin_creds.stdout }}"

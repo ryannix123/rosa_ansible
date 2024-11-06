@@ -1,0 +1,143 @@
+---
+- name: Delete ROSA HCP Cluster and Resources
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    cluster_name: "rosa-hcp-cluster"
+    region: "us-east-2"
+    operator_roles_prefix: "{{ cluster_name }}-operator"
+    account_roles_prefix: "{{ cluster_name }}-account"
+    vpc_name: "rosa-hcp-vpc"
+    timeout_minutes: 5
+
+  tasks:
+    - name: Delete ROSA cluster
+      command: >
+        rosa delete cluster 
+        --cluster {{ cluster_name }}
+        --yes
+      register: cluster_deletion
+      async: "{{ timeout_minutes * 60 }}"
+      poll: 30
+      ignore_errors: yes
+
+    - name: Wait for cluster deletion
+      shell: |
+        if rosa describe cluster --cluster {{ cluster_name }} 2>/dev/null; then
+          exit 1
+        else
+          exit 0
+        fi
+      register: cluster_status
+      until: cluster_status.rc == 0
+      retries: 60
+      delay: 60
+      ignore_errors: yes
+
+    - name: Delete operator roles
+      command: >
+        rosa delete operator-roles 
+        --prefix {{ operator_roles_prefix }}
+        --mode auto
+        --yes
+      ignore_errors: yes
+
+    - name: Delete account roles
+      command: >
+        rosa delete account-roles 
+        --prefix {{ account_roles_prefix }}
+        --mode auto
+        --yes
+      ignore_errors: yes
+
+    - name: Delete OIDC config
+      command: >
+        rosa delete oidc-config
+        --mode auto
+        --yes
+      ignore_errors: yes
+
+    - name: Delete VPC resources
+      block:
+        - name: Get VPC ID
+          command: >
+            aws ec2 describe-vpcs
+            --region {{ region }}
+            --filters "Name=tag:Name,Values={{ vpc_name }}"
+            --query 'Vpcs[0].VpcId'
+            --output text
+          register: vpc_id_output
+
+        - name: Delete NAT Gateways
+          shell: |
+            for natgw in $(aws ec2 describe-nat-gateways --region {{ region }} --filter "Name=vpc-id,Values={{ vpc_id_output.stdout }}" --query 'NatGateways[].NatGatewayId' --output text); do
+              aws ec2 delete-nat-gateway --nat-gateway-id $natgw --region {{ region }}
+            done
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+        - name: Wait for NAT Gateways deletion
+          pause:
+            seconds: 60
+
+        - name: Delete EIPs
+          shell: |
+            for eip in $(aws ec2 describe-addresses --region {{ region }} --query 'Addresses[?AssociationId==null].AllocationId' --output text); do
+              aws ec2 release-address --allocation-id $eip --region {{ region }}
+            done
+          ignore_errors: yes
+
+        - name: Delete route table associations
+          shell: |
+            for rt in $(aws ec2 describe-route-tables --region {{ region }} --filters "Name=vpc-id,Values={{ vpc_id_output.stdout }}" --query 'RouteTables[].RouteTableId' --output text); do
+              for assoc in $(aws ec2 describe-route-tables --region {{ region }} --route-table-ids $rt --query 'RouteTables[].Associations[?!Main][AssociationId]' --output text); do
+                aws ec2 disassociate-route-table --association-id $assoc --region {{ region }}
+              done
+            done
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+        - name: Delete non-main route tables
+          shell: |
+            for rt in $(aws ec2 describe-route-tables --region {{ region }} --filters "Name=vpc-id,Values={{ vpc_id_output.stdout }}" --query 'RouteTables[?!Associations[?Main]].RouteTableId' --output text); do
+              aws ec2 delete-route-table --route-table-id $rt --region {{ region }}
+            done
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+        - name: Detach Internet Gateway
+          shell: |
+            for igw in $(aws ec2 describe-internet-gateways --region {{ region }} --filters "Name=attachment.vpc-id,Values={{ vpc_id_output.stdout }}" --query 'InternetGateways[].InternetGatewayId' --output text); do
+              aws ec2 detach-internet-gateway --internet-gateway-id $igw --vpc-id {{ vpc_id_output.stdout }} --region {{ region }}
+            done
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+        - name: Delete Internet Gateway
+          shell: |
+            for igw in $(aws ec2 describe-internet-gateways --region {{ region }} --filters "Name=attachment.vpc-id,Values={{ vpc_id_output.stdout }}" --query 'InternetGateways[].InternetGatewayId' --output text); do
+              aws ec2 delete-internet-gateway --internet-gateway-id $igw --region {{ region }}
+            done
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+        - name: Delete subnets
+          shell: |
+            for subnet in $(aws ec2 describe-subnets --region {{ region }} --filters "Name=vpc-id,Values={{ vpc_id_output.stdout }}" --query 'Subnets[].SubnetId' --output text); do
+              aws ec2 delete-subnet --subnet-id $subnet --region {{ region }}
+            done
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+        - name: Delete VPC
+          command: >
+            aws ec2 delete-vpc
+            --vpc-id {{ vpc_id_output.stdout }}
+            --region {{ region }}
+          when: vpc_id_output.stdout != "None" and vpc_id_output.stdout != "null"
+          ignore_errors: yes
+
+    - name: Display completion message
+      debug:
+        msg: "ROSA cluster and associated resources have been deleted"
